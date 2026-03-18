@@ -1,139 +1,215 @@
 #include <Arduino.h>
-/// Порты датчика 
+#include <Wire.h>
+#include <Adafruit_BNO055.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55);
+
+/// Пины
 #define TRIG_L 25
 #define ECHO_L 26
 #define TRIG_C 27
 #define ECHO_C 14
 #define TRIG_R 12
 #define ECHO_R 13
-//////Порты РЕЛЕ
-#define RELAY_L  4
-#define RELAY_R  2
-/// Порты управления 
+
+#define RELAY_L 4
+#define RELAY_R 2
+
 #define FlagPort 5
-// порог в сантиметрах (2.9 метра)
+#define SIGNAL_PIN 15
+
 #define DIST_THRESHOLD_CM 290
 
+/// ===== Shared Data =====
+struct SharedData {
+  long distanceL;
+  long distanceC;
+  long distanceR;
+  float yaw;
+};
+
+SharedData data;
+
+SemaphoreHandle_t dataMutex;
+
+/// ===== Ультразвук =====
+long measureDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long d = pulseIn(echo, HIGH, 30000);
+  if (d == 0) return -1;
+  return d * 0.0343 / 2;
+}
+
+/// ===== Гироскоп =====
+float getYaw() {
+  sensors_event_t event;
+  bno.getEvent(&event);
+  return event.orientation.x;
+}
+
+/// ===== МОТОРЫ =====
+void forward() {
+  digitalWrite(RELAY_L, HIGH);
+  digitalWrite(RELAY_R, HIGH);
+}
+
+void right() {
+  digitalWrite(RELAY_L, HIGH);
+  digitalWrite(RELAY_R, LOW);
+}
+
+void left() {
+  digitalWrite(RELAY_L, LOW);
+  digitalWrite(RELAY_R, HIGH);
+}
+
+void stopM() {
+  digitalWrite(RELAY_L, LOW);
+  digitalWrite(RELAY_R, LOW);
+}
+
+/// ===== FSM =====
+enum State {
+  FORWARD,
+  TURN_RIGHT,
+  TURN_LEFT,
+  STOPPED
+};
+
+State currentState = FORWARD;
+
+/// ===== TASK 1: ДАТЧИКИ =====
+void TaskSensors(void *pvParameters) {
+  while (true) {
+
+    long dL = measureDistance(TRIG_L, ECHO_L);
+    long dC = measureDistance(TRIG_C, ECHO_C);
+    long dR = measureDistance(TRIG_R, ECHO_R);
+
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      data.distanceL = dL;
+      data.distanceC = dC;
+      data.distanceR = dR;
+      xSemaphoreGive(dataMutex);
+    }
+
+    vTaskDelay(60 / portTICK_PERIOD_MS);
+  }
+}
+
+/// ===== TASK 2: ГИРО =====
+void TaskGyro(void *pvParameters) {
+  while (true) {
+
+    float y = getYaw();
+
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      data.yaw = y;
+      xSemaphoreGive(dataMutex);
+    }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+/// ===== TASK 3: ЛОГИКА =====
+void TaskControl(void *pvParameters) {
+
+  while (true) {
+
+    long dL, dC, dR;
+    float yaw;
+
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      dL = data.distanceL;
+      dC = data.distanceC;
+      dR = data.distanceR;
+      yaw = data.yaw;
+      xSemaphoreGive(dataMutex);
+    }
+
+    bool L_free = (dL == -1 || dL > DIST_THRESHOLD_CM);
+    bool C_free = (dC == -1 || dC > DIST_THRESHOLD_CM);
+    bool R_free = (dR == -1 || dR > DIST_THRESHOLD_CM);
+
+    int flag = digitalRead(FlagPort);
+
+    if (flag == HIGH) {
+      forward();
+      vTaskDelay(30 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    switch (currentState) {
+
+      case FORWARD:
+        if (C_free) {
+          forward();
+        } else {
+          if (R_free) currentState = TURN_RIGHT;
+          else if (L_free) currentState = TURN_LEFT;
+          else currentState = STOPPED;
+        }
+        break;
+
+      case TURN_RIGHT:
+        right();
+        if (C_free) currentState = FORWARD;
+        break;
+
+      case TURN_LEFT:
+        left();
+        if (C_free) currentState = FORWARD;
+        break;
+
+      case STOPPED:
+        stopM();
+        digitalWrite(SIGNAL_PIN, HIGH);
+        break;
+    }
+
+    Serial.print("Yaw: "); Serial.print(yaw);
+    Serial.print(" C: "); Serial.print(dC);
+    Serial.print(" State: "); Serial.println(currentState);
+
+    vTaskDelay(30 / portTICK_PERIOD_MS);
+  }
+}
+
+/// ===== SETUP =====
 void setup() {
   Serial.begin(115200);
-/////// PINMODES
+  Wire.begin();
+
+  bno.begin();
+  delay(1000);
+
   pinMode(TRIG_L, OUTPUT);
   pinMode(ECHO_L, INPUT);
   pinMode(TRIG_C, OUTPUT);
   pinMode(ECHO_C, INPUT);
   pinMode(TRIG_R, OUTPUT);
   pinMode(ECHO_R, INPUT);
-  pinMode(RELAY_R, OUTPUT);
+
   pinMode(RELAY_L, OUTPUT);
-  ///
-  pinMode(FlagPort,INPUT);
-  // включаем реле по умолчанию
-  digitalWrite(RELAY_L, HIGH); 
-  digitalWrite(RELAY_R, HIGH);
-}
+  pinMode(RELAY_R, OUTPUT);
+  pinMode(FlagPort, INPUT);
+  pinMode(SIGNAL_PIN, OUTPUT);
 
-long measureDistanceCM_LEFT() {
-  // очищаем TRIG
-  digitalWrite(TRIG_L, LOW);
-  delayMicroseconds(2);
-  // импульс 10 мкс
-  digitalWrite(TRIG_L, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_L, LOW);
-  // измеряем echo (таймаут 30 мс ≈ 5 м)
-  long duration = pulseIn(ECHO_L, HIGH, 30000);
-  if (duration == 0) {
-    return -1; // нет сигнала
-  }
-  // скорость звука 343 м/с
-  long distance = duration * 0.0343 / 2;
-  return distance;
-}
+  dataMutex = xSemaphoreCreateMutex();
 
-long measureDistanceCM_CENTER() {
-  // очищаем TRIG
-  digitalWrite(TRIG_C, LOW);
-  delayMicroseconds(2);
-  // импульс 10 мкс
-  digitalWrite(TRIG_C, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_C, LOW);
-  // измеряем echo (таймаут 30 мс ≈ 5 м)
-  long duration = pulseIn(ECHO_C, HIGH, 30000);
-  if (duration == 0) {
-    return -1; // нет сигнала
-  }
-  // скорость звука 343 м/с
-  long distance = duration * 0.0343 / 2;
-  return distance;
-}
+  /// Запуск задач
 
-long measureDistanceCM_RIGHT() {
-  // очищаем TRIG
-  digitalWrite(TRIG_R, LOW);
-  delayMicroseconds(2);
-  // импульс 10 мкс
-  digitalWrite(TRIG_R, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_R, LOW);
-  // измеряем echo (таймаут 30 мс ≈ 5 м)
-  long duration = pulseIn(ECHO_R, HIGH, 30000);
-  if (duration == 0) {
-    return -1; // нет сигнала
-  }
-  // скорость звука 343 м/с
-  long distance = duration * 0.0343 / 2;
-  return distance;
+  xTaskCreatePinnedToCore(TaskSensors, "Sensors", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskGyro, "Gyro", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskControl, "Control", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
-  long distanceL = measureDistanceCM_LEFT();
-  long distanceC = measureDistanceCM_CENTER();
-  long distanceR = measureDistanceCM_RIGHT();
- 
-  int Flag = digitalRead(FlagPort);
-
-    Serial.print("Distance Left: ");
-    Serial.print(distanceL);
-    Serial.println(" cm");
-    
-    Serial.print("Distance Center: ");
-    Serial.print(distanceC);
-    Serial.println(" cm");
-
-    Serial.print("Distance Right: ");
-    Serial.print(distanceR);
-    Serial.println(" cm");
-
-if(Flag==LOW){
-    if (distanceL > DIST_THRESHOLD_CM && distanceC >DIST_THRESHOLD_CM && distanceR >DIST_THRESHOLD_CM || distanceC , distanceR ,distanceL ==-1) {
-      // объект ближе 3 м → выключаем реле
-           digitalWrite(RELAY_L, HIGH);
-           digitalWrite(RELAY_R, HIGH);
-      Serial.println("RELAY ON FRONT");} 
-    else if(distanceL < DIST_THRESHOLD_CM && distanceC < DIST_THRESHOLD_CM && distanceR > DIST_THRESHOLD_CM || 
-    distanceL < DIST_THRESHOLD_CM && distanceC < DIST_THRESHOLD_CM && distanceR ==-1){    
-           digitalWrite(RELAY_L, HIGH);
-           digitalWrite(RELAY_R, LOW);
-      Serial.println("RELAY ON- ROTATE RIGHT");}
-    else if(distanceR < DIST_THRESHOLD_CM && distanceC < DIST_THRESHOLD_CM && distanceL > DIST_THRESHOLD_CM || 
-    distanceR < DIST_THRESHOLD_CM && distanceC < DIST_THRESHOLD_CM && distanceL ==-1){    
-           digitalWrite(RELAY_L, LOW);
-           digitalWrite(RELAY_R, HIGH);
-      Serial.println("RELAY ON- ROTATE LEFT");}
-    else if(distanceR < DIST_THRESHOLD_CM && distanceC < DIST_THRESHOLD_CM && distanceL < DIST_THRESHOLD_CM){    
-           digitalWrite(RELAY_L, LOW);
-           digitalWrite(RELAY_R, LOW);
-      Serial.println("RELAY ON- MOVE BACK");}
-    else {
-      digitalWrite(RELAY_L, LOW);
-      digitalWrite(RELAY_R, LOW); 
-      Serial.println("RELAY OFF");
-    }}
-    else{     
-      digitalWrite(RELAY_L, LOW);
-      digitalWrite(RELAY_R, LOW); 
-      Serial.println("RELAY OFF");}
-  // Serial.println("No echo signal");
-  delay(50);
+  // пусто — всё работает в задачах
 }
